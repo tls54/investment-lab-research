@@ -2,3 +2,4 @@ papers/
 *.csv
 __pycache__
 Forecasts/
+.DS_store
