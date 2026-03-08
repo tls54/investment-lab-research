@@ -1,0 +1,4 @@
+papers/
+*.csv
+__pycache__
+Forecasts/
