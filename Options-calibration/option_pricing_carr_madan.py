@@ -16,7 +16,8 @@ import numpy as np
 import scipy.stats
 from scipy.integrate import quad
 from scipy.interpolate import CubicSpline
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution
+import itertools
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +298,8 @@ def vec_implied_volatility(prices, S, K, T, r, option_type='call',
             break
 
         can_step = ~converged & (v > 1e-10)
-        sigma = np.where(can_step, np.clip(sigma - diff / v, 0.001, 5.0), sigma)
+        safe_v = np.where(can_step, v, 1.0)   # avoid div/0 before np.where masks
+        sigma = np.where(can_step, np.clip(sigma - diff / safe_v, 0.001, 5.0), sigma)
 
     return np.where(converged, sigma, np.nan)
 
@@ -411,40 +413,156 @@ def objective(heston_params, strikes, maturities, market_ivs, S, r, opt_type='ca
     return iv_loss(market_ivs, heston_ivs)
 
 
+def _surface_flatness(strikes, maturities, market_ivs, S):
+    """
+    Measure IV surface flatness along three axes to determine whether
+    a global search is needed before local refinement.
+
+    Returns
+    -------
+    dict with keys:
+        atm_term_struct_std  : std of ATM IVs across maturities (identifies kappa)
+        mean_smile_curvature : mean wing IV − ATM IV            (identifies xi)
+        mean_skew            : mean abs put/call wing asymmetry  (identifies rho)
+        use_global_search    : True if any axis is flat enough to
+                               risk L-BFGS-B missing the right basin
+    """
+    strikes    = np.asarray(strikes,    dtype=float)
+    maturities = np.asarray(maturities, dtype=float)
+    market_ivs = np.asarray(market_ivs, dtype=float)
+
+    atm_ivs    = []
+    curvatures = []
+    skews      = []
+    wing_dist  = 0.05 * S
+
+    for T in np.unique(maturities):
+        mask     = maturities == T
+        K_slice  = strikes[mask]
+        iv_slice = market_ivs[mask]
+        valid    = np.isfinite(iv_slice)
+
+        if valid.sum() < 2:
+            continue
+
+        atm_idx = np.argmin(np.abs(K_slice - S))
+        atm_iv  = iv_slice[atm_idx]
+        atm_ivs.append(atm_iv)
+
+        wing_mask = valid & (np.abs(K_slice - S) > wing_dist)
+        if wing_mask.sum() >= 2:
+            curvatures.append(np.mean(iv_slice[wing_mask]) - atm_iv)
+
+        put_wing  = valid & (K_slice < S - wing_dist)
+        call_wing = valid & (K_slice > S + wing_dist)
+        if put_wing.sum() >= 1 and call_wing.sum() >= 1:
+            skews.append(np.mean(iv_slice[put_wing]) - np.mean(iv_slice[call_wing]))
+
+    atm_std   = float(np.std(atm_ivs))             if len(atm_ivs)    >= 2 else 0.0
+    mean_curv = float(np.mean(curvatures))          if len(curvatures) >= 1 else 0.0
+    mean_skew = float(np.mean(np.abs(skews)))       if len(skews)      >= 1 else 0.0
+
+    # Thresholds in raw IV units (calibrated from observed surface diagnostics):
+    #   calm:  atm_std=0.00016, mean_curv=0.00326, mean_skew=0.03458
+    #   event: atm_std=0.01449, mean_curv=0.00023, mean_skew=0.08020
+    TERM_THRESH = 0.001   # flags calm (0.00016) not event (0.01449)
+    CURV_THRESH = 0.001   # flags event (0.00023) not calm (0.00326)
+    SKEW_THRESH = 0.001   # both well above — neither flagged
+
+    use_global = (atm_std   < TERM_THRESH or
+                  mean_curv < CURV_THRESH or
+                  mean_skew < SKEW_THRESH)
+
+    return {
+        'atm_term_struct_std':  atm_std,
+        'mean_smile_curvature': mean_curv,
+        'mean_skew':            mean_skew,
+        'use_global_search':    use_global,
+    }
+
+
+def _global_search_x0(objective, obj_args, all_bounds,
+                       popsize=8, maxiter=100, tol=1e-3):
+    """
+    Run a full 5D differential evolution search to find a good starting
+    basin for L-BFGS-B. Used when the IV surface is too flat for the
+    local solver to reliably identify the correct parameter region.
+
+    Returns
+    -------
+    best_x : np.ndarray [v0, kappa, theta, xi, rho]
+    """
+    de_result = differential_evolution(
+        objective,
+        bounds=all_bounds,
+        args=obj_args,
+        maxiter=maxiter,
+        popsize=popsize,
+        tol=tol,
+        seed=0,
+        polish=False,
+        workers=-1, 
+
+    )
+
+    print(f"  [DE global search — loss={de_result.fun:.6f}, "
+          f"nfev={de_result.nfev}]")
+    print(f"    v0={de_result.x[0]:.4f}  kappa={de_result.x[1]:.4f}  "
+          f"theta={de_result.x[2]:.4f}  xi={de_result.x[3]:.4f}  "
+          f"rho={de_result.x[4]:.4f}")
+
+    return de_result.x
+
+
 def calibrate_heston(strikes, maturities, market_ivs, S, r,
                      x0=None, opt_type='call', alpha=1.5, N=4096, eta=0.25):
     """
     Calibrate Heston parameters to a market IV surface using Carr-Madan FFT pricing.
 
+    Flat surfaces (where L-BFGS-B is likely to miss the correct basin) are
+    detected automatically and trigger a full 5D differential evolution global
+    search before local refinement. Rich surfaces go straight to L-BFGS-B.
+
     Parameters
     ----------
     strikes, maturities : array-like
-        Parallel 1-D arrays.
-    market_ivs : np.ndarray
-        Market implied volatilities.
-    S, r : float
+    market_ivs          : np.ndarray
+    S, r                : float
     x0 : array-like, optional
-        Initial guess [v0, kappa, theta, xi, rho]. Defaults to [0.04, 2.0, 0.04, 0.3, -0.7].
-    opt_type : {'call', 'put'}
-    alpha, N, eta : Carr-Madan FFT parameters.
+        Initial guess [v0, kappa, theta, xi, rho].
+        Defaults to [0.04, 2.0, 0.04, 0.3, -0.7] for rich surfaces.
+        Ignored when a global search is triggered.
+    opt_type            : {'call', 'put'}
+    alpha, N, eta       : Carr-Madan FFT parameters.
 
     Returns
     -------
     scipy.optimize.OptimizeResult
-        result.x = [v0, kappa, theta, xi, rho]
+        result.x   = [v0, kappa, theta, xi, rho]
         result.fun = MSE loss
     """
-    if x0 is None:
-        x0 = np.array([0.04, 2.0, 0.04, 0.3, -0.7])
+    all_bounds = [(1e-4, 1.0), (0.1, 15.0), (1e-4, 1.0), (1e-4, 2.0), (-0.99, 0.99)]
+    obj_args   = (strikes, maturities, market_ivs, S, r, opt_type, alpha, N, eta)
 
-    bounds = [(1e-4, 1.0), (1e-4, 15.0), (1e-4, 1.0), (1e-4, 2.0), (-0.99, 0.99)]
+    flatness = _surface_flatness(strikes, maturities, market_ivs, S)
+
+    if flatness['use_global_search']:
+        print(f"  [flat surface detected — "
+              f"ATM term-struct std={flatness['atm_term_struct_std']*100:.3f} vpts, "
+              f"smile curv={flatness['mean_smile_curvature']*100:.3f} vpts, "
+              f"skew={flatness['mean_skew']*100:.3f} vpts]")
+        x0 = _global_search_x0(objective, obj_args, all_bounds)
+    else:
+        if x0 is None:
+            x0 = np.array([0.04, 2.0, 0.04, 0.3, -0.7])
+        x0 = np.asarray(x0, dtype=float)
 
     return minimize(
         fun=objective,
         x0=x0,
-        args=(strikes, maturities, market_ivs, S, r, opt_type, alpha, N, eta),
+        args=obj_args,
         method='L-BFGS-B',
-        bounds=bounds,
+        bounds=all_bounds,
     )
 
 
