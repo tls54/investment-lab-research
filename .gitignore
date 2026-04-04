@@ -3,3 +3,4 @@ papers/
 __pycache__
 Forecasts/
 .DS_store
+.vscode
